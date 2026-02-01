@@ -6,27 +6,26 @@ Endpoints:
 - GET /health - health check
 - POST /info - get video info
 - POST /download - get direct download URL
-- POST /proxy-download - download through server (for IP-locked CDN links)
+- POST /proxy-download - proxy stream from CDN (fast, starts immediately)
 """
 
 import os
 import hashlib
 import time
-import tempfile
-import shutil
 import asyncio
+import httpx
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import yt_dlp
 
 app = FastAPI(
     title="Video Downloader API",
     description="API for downloading videos from YouTube, VK, TikTok and other platforms",
-    version="1.4.0"
+    version="1.5.0"
 )
 
 app.add_middleware(
@@ -38,6 +37,13 @@ app.add_middleware(
 )
 
 executor = ThreadPoolExecutor(max_workers=4)
+
+# HTTP client для проксирования
+http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(30.0, read=300.0),
+    follow_redirects=True,
+    limits=httpx.Limits(max_connections=20)
+)
 
 video_cache = {}
 CACHE_TTL = 300
@@ -140,20 +146,11 @@ def _extract_info_sync(url: str, ydl_opts: dict):
         return ydl.extract_info(url, download=False)
 
 
-def _download_video_sync(url: str, ydl_opts: dict, output_path: str) -> dict:
-    """Синхронное скачивание видео в файл."""
-    ydl_opts = ydl_opts.copy()
-    ydl_opts['outtmpl'] = output_path
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
-
-
 @app.get("/")
 async def root():
     return {
         "service": "Video Downloader API",
-        "version": "1.4.0",
+        "version": "1.5.0",
         "endpoints": {
             "health": "/health",
             "info": "POST /info",
@@ -375,10 +372,10 @@ async def get_download_url(request: DownloadRequest):
 
 
 @app.post("/proxy-download")
-async def proxy_download(request: ProxyDownloadRequest, background_tasks: BackgroundTasks):
+async def proxy_download(request: ProxyDownloadRequest):
     """
-    Download video through server and stream to client.
-    Used when CDN links are IP-locked.
+    Proxy video stream from CDN.
+    Gets the direct URL and proxies the stream - starts immediately!
     """
     url = request.url
     format_id = request.format_id
@@ -387,13 +384,12 @@ async def proxy_download(request: ProxyDownloadRequest, background_tasks: Backgr
     platform = detect_platform(url)
     ydl_opts = get_ydl_opts(platform)
 
-    # Для прокси скачивания используем формат который не требует merge
+    # Для прокси используем формат без merge (mp4 с аудио)
     if format_id:
         format_spec = format_id
     elif quality == "audio":
         format_spec = "bestaudio[ext=m4a]/bestaudio/best"
     elif quality == "best":
-        # Используем best без merge - предпочитаем mp4 с аудио
         format_spec = "best[ext=mp4]/best"
     elif quality in ["1080p", "720p", "480p", "360p"]:
         height = quality.replace("p", "")
@@ -403,85 +399,77 @@ async def proxy_download(request: ProxyDownloadRequest, background_tasks: Backgr
 
     ydl_opts['format'] = format_spec
 
-    # Создаём временную директорию
-    temp_dir = tempfile.mkdtemp()
-    output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
-
     try:
-        # Скачиваем видео
+        # Получаем URL для скачивания
         loop = asyncio.get_event_loop()
-
-        def download_sync():
-            opts = ydl_opts.copy()
-            opts['outtmpl'] = output_template
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=True)
-
-        info = await loop.run_in_executor(executor, download_sync)
+        info = await loop.run_in_executor(executor, _extract_info_sync, url, ydl_opts)
 
         if not info:
-            shutil.rmtree(temp_dir, ignore_errors=True)
             raise HTTPException(status_code=404, detail="Video not found")
 
-        # Находим скачанный файл
-        video_id = info.get("id", "video")
-        ext = info.get("ext", "mp4")
-        expected_file = os.path.join(temp_dir, f"{video_id}.{ext}")
+        # Получаем прямую ссылку
+        download_url = info.get("url")
+        if not download_url:
+            formats = info.get("formats", [])
+            if formats:
+                download_url = formats[-1].get("url")
 
-        if not os.path.exists(expected_file):
-            # Ищем любой файл в директории
-            files = os.listdir(temp_dir)
-            if files:
-                expected_file = os.path.join(temp_dir, files[0])
-            else:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                raise HTTPException(status_code=500, detail="Downloaded file not found")
+        if not download_url:
+            raise HTTPException(status_code=500, detail="Could not get download URL")
 
-        file_size = os.path.getsize(expected_file)
         title = info.get("title", "video")
         safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:50]
+        ext = info.get("ext", "mp4")
+        filename = f"{safe_title}.{ext}"
+        duration = info.get("duration", 0)
 
-        # Определяем расширение файла
-        file_ext = os.path.splitext(expected_file)[1] or ".mp4"
-        filename = f"{safe_title}{file_ext}"
+        # Получаем заголовки для запроса к CDN
+        headers = ydl_opts.get('http_headers', {}).copy()
+        headers['Accept'] = '*/*'
+        headers['Accept-Encoding'] = 'identity'
+
+        # Проксируем стрим от CDN к клиенту
+        async def stream_proxy():
+            try:
+                async with http_client.stream('GET', download_url, headers=headers) as response:
+                    async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
+                        yield chunk
+            except Exception as e:
+                print(f"Proxy stream error: {e}")
+
+        # Получаем размер файла если возможно
+        try:
+            head_response = await http_client.head(download_url, headers=headers)
+            content_length = head_response.headers.get('content-length')
+        except:
+            content_length = None
+
+        response_headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Video-Title": title[:100],
+            "X-Video-Duration": str(duration),
+        }
+        if content_length:
+            response_headers["Content-Length"] = content_length
 
         # Определяем media type
         media_type = "video/mp4"
-        if file_ext == ".webm":
+        if ext == "webm":
             media_type = "video/webm"
-        elif file_ext == ".mkv":
+        elif ext == "mkv":
             media_type = "video/x-matroska"
-
-        # Сохраняем путь для очистки
-        file_path = expected_file
-        dir_to_clean = temp_dir
-
-        async def file_streamer():
-            """Стримим файл и удаляем после завершения."""
-            try:
-                with open(file_path, 'rb') as f:
-                    while True:
-                        chunk = f.read(256 * 1024)  # 256KB chunks
-                        if not chunk:
-                            break
-                        yield chunk
-            finally:
-                # Удаляем temp директорию после стриминга
-                shutil.rmtree(dir_to_clean, ignore_errors=True)
+        elif ext == "m4a":
+            media_type = "audio/mp4"
+        elif ext == "mp3":
+            media_type = "audio/mpeg"
 
         return StreamingResponse(
-            file_streamer(),
+            stream_proxy(),
             media_type=media_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(file_size),
-                "X-Video-Title": title[:100],
-                "X-Video-Duration": str(info.get("duration", 0)),
-            }
+            headers=response_headers
         )
 
     except yt_dlp.DownloadError as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
         error_msg = str(e)
         if "Sign in" in error_msg or "bot" in error_msg.lower():
             raise HTTPException(status_code=403, detail="Platform requires authorization")
@@ -490,13 +478,16 @@ async def proxy_download(request: ProxyDownloadRequest, background_tasks: Backgr
         elif "unavailable" in error_msg.lower() or "not available" in error_msg.lower():
             raise HTTPException(status_code=404, detail="Video unavailable or deleted")
         else:
-            raise HTTPException(status_code=500, detail=f"Download error: {error_msg[:200]}")
+            raise HTTPException(status_code=500, detail=f"Error: {error_msg[:200]}")
     except HTTPException:
-        shutil.rmtree(temp_dir, ignore_errors=True)
         raise
     except Exception as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Error: {str(e)[:200]}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await http_client.aclose()
 
 
 if __name__ == "__main__":
