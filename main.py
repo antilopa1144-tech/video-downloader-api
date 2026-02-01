@@ -10,13 +10,13 @@ Endpoints:
 """
 
 import os
-import json
-import asyncio
 import hashlib
 import time
 import tempfile
 import shutil
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -26,7 +26,7 @@ import yt_dlp
 app = FastAPI(
     title="Video Downloader API",
     description="API for downloading videos from YouTube, VK, TikTok and other platforms",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -36,6 +36,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Thread pool для выполнения блокирующих операций yt-dlp
+executor = ThreadPoolExecutor(max_workers=4)
 
 video_cache = {}
 CACHE_TTL = 300
@@ -89,17 +92,18 @@ def get_ydl_opts(platform: str) -> dict:
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
-        'socket_timeout': 30,
-        'retries': 3,
-        'fragment_retries': 3,
+        'socket_timeout': 60,
+        'retries': 5,
+        'fragment_retries': 5,
+        'extractor_retries': 3,
     }
 
-    chrome_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    chrome_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
 
     if platform == 'youtube':
         return {
             **base_opts,
-            'socket_timeout': 60,
+            'socket_timeout': 90,
             'http_headers': {
                 'User-Agent': chrome_ua,
                 'Accept-Language': 'en-US,en;q=0.9',
@@ -131,11 +135,23 @@ def get_ydl_opts(platform: str) -> dict:
         }
 
 
+def _extract_info_sync(url: str, ydl_opts: dict):
+    """Синхронное извлечение информации о видео."""
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _download_video_sync(url: str, ydl_opts: dict):
+    """Синхронное скачивание видео."""
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=True)
+
+
 @app.get("/")
 async def root():
     return {
         "service": "Video Downloader API",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "endpoints": {
             "health": "/health",
             "info": "POST /info",
@@ -174,77 +190,78 @@ async def get_video_info(request: VideoRequest):
     ydl_opts['extract_flat'] = False
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        # Выполняем в thread pool чтобы не блокировать event loop
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, _extract_info_sync, url, ydl_opts)
 
-            if not info:
-                raise HTTPException(status_code=404, detail="Video not found")
+        if not info:
+            raise HTTPException(status_code=404, detail="Video not found")
 
-            formats = []
-            for f in info.get("formats", []):
-                vcodec = f.get("vcodec", "none")
-                acodec = f.get("acodec", "none")
+        formats = []
+        for f in info.get("formats", []):
+            vcodec = f.get("vcodec", "none")
+            acodec = f.get("acodec", "none")
 
-                if vcodec == "none" and acodec != "none":
-                    formats.append({
-                        "format_id": f.get("format_id"),
-                        "ext": f.get("ext", "mp3"),
-                        "quality": "audio",
-                        "resolution": "Audio only",
-                        "filesize": f.get("filesize") or f.get("filesize_approx"),
-                        "has_audio": True,
-                        "has_video": False,
-                        "height": 0,
-                    })
-                elif vcodec != "none":
-                    height = f.get("height", 0) or 0
-                    formats.append({
-                        "format_id": f.get("format_id"),
-                        "ext": f.get("ext", "mp4"),
-                        "quality": f"{height}p" if height else "unknown",
-                        "resolution": f.get("resolution", f"{height}p"),
-                        "filesize": f.get("filesize") or f.get("filesize_approx"),
-                        "has_audio": acodec != "none",
-                        "has_video": True,
-                        "height": height,
-                    })
+            if vcodec == "none" and acodec != "none":
+                formats.append({
+                    "format_id": f.get("format_id"),
+                    "ext": f.get("ext", "mp3"),
+                    "quality": "audio",
+                    "resolution": "Audio only",
+                    "filesize": f.get("filesize") or f.get("filesize_approx"),
+                    "has_audio": True,
+                    "has_video": False,
+                    "height": 0,
+                })
+            elif vcodec != "none":
+                height = f.get("height", 0) or 0
+                formats.append({
+                    "format_id": f.get("format_id"),
+                    "ext": f.get("ext", "mp4"),
+                    "quality": f"{height}p" if height else "unknown",
+                    "resolution": f.get("resolution", f"{height}p"),
+                    "filesize": f.get("filesize") or f.get("filesize_approx"),
+                    "has_audio": acodec != "none",
+                    "has_video": True,
+                    "height": height,
+                })
 
-            formats = sorted(
-                [f for f in formats if f.get("height", 0) > 0 or f.get("quality") == "audio"],
-                key=lambda x: x.get("height", 0),
-                reverse=True
-            )
+        formats = sorted(
+            [f for f in formats if f.get("height", 0) > 0 or f.get("quality") == "audio"],
+            key=lambda x: x.get("height", 0),
+            reverse=True
+        )
 
-            seen = set()
-            unique_formats = []
-            for f in formats:
-                q = f["quality"]
-                if q not in seen:
-                    seen.add(q)
-                    unique_formats.append(f)
+        seen = set()
+        unique_formats = []
+        for f in formats:
+            q = f["quality"]
+            if q not in seen:
+                seen.add(q)
+                unique_formats.append(f)
 
-            result = {
-                "success": True,
-                "platform": platform,
-                "data": {
-                    "id": info.get("id"),
-                    "title": info.get("title", "Unknown"),
-                    "description": (info.get("description") or "")[:500],
-                    "thumbnail": info.get("thumbnail"),
-                    "duration": info.get("duration", 0),
-                    "uploader": info.get("uploader", "Unknown"),
-                    "view_count": info.get("view_count"),
-                    "webpage_url": info.get("webpage_url", url),
-                    "formats": unique_formats[:10],
-                }
+        result = {
+            "success": True,
+            "platform": platform,
+            "data": {
+                "id": info.get("id"),
+                "title": info.get("title", "Unknown"),
+                "description": (info.get("description") or "")[:500],
+                "thumbnail": info.get("thumbnail"),
+                "duration": info.get("duration", 0),
+                "uploader": info.get("uploader", "Unknown"),
+                "view_count": info.get("view_count"),
+                "webpage_url": info.get("webpage_url", url),
+                "formats": unique_formats[:10],
             }
+        }
 
-            video_cache[cache_key] = {
-                "data": result,
-                "timestamp": time.time()
-            }
+        video_cache[cache_key] = {
+            "data": result,
+            "timestamp": time.time()
+        }
 
-            return result
+        return result
 
     except yt_dlp.DownloadError as e:
         error_msg = str(e)
@@ -258,6 +275,8 @@ async def get_video_info(request: VideoRequest):
             raise HTTPException(status_code=403, detail="Video not available in your region")
         else:
             raise HTTPException(status_code=500, detail=f"Extraction error: {error_msg[:200]}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)[:200])
 
@@ -286,57 +305,57 @@ async def get_download_url(request: DownloadRequest):
     ydl_opts['format'] = format_spec
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, _extract_info_sync, url, ydl_opts)
 
-            if not info:
-                raise HTTPException(status_code=404, detail="Video not found")
+        if not info:
+            raise HTTPException(status_code=404, detail="Video not found")
 
-            download_url = info.get("url")
+        download_url = info.get("url")
 
-            if not download_url:
-                formats = info.get("formats", [])
-                if formats:
-                    download_url = formats[-1].get("url")
+        if not download_url:
+            formats = info.get("formats", [])
+            if formats:
+                download_url = formats[-1].get("url")
 
-            if not download_url:
-                requested = info.get("requested_formats", [])
-                if requested:
-                    video_url = None
-                    audio_url = None
-                    for f in requested:
-                        if f.get("vcodec") != "none":
-                            video_url = f.get("url")
-                        if f.get("acodec") != "none":
-                            audio_url = f.get("url")
+        if not download_url:
+            requested = info.get("requested_formats", [])
+            if requested:
+                video_url = None
+                audio_url = None
+                for f in requested:
+                    if f.get("vcodec") != "none":
+                        video_url = f.get("url")
+                    if f.get("acodec") != "none":
+                        audio_url = f.get("url")
 
-                    if video_url:
-                        return {
-                            "success": True,
-                            "platform": platform,
-                            "title": info.get("title", "video"),
-                            "ext": info.get("ext", "mp4"),
-                            "download_url": video_url,
-                            "audio_url": audio_url,
-                            "needs_merge": audio_url is not None and video_url != audio_url,
-                            "duration": info.get("duration"),
-                            "filesize": info.get("filesize") or info.get("filesize_approx"),
-                        }
+                if video_url:
+                    return {
+                        "success": True,
+                        "platform": platform,
+                        "title": info.get("title", "video"),
+                        "ext": info.get("ext", "mp4"),
+                        "download_url": video_url,
+                        "audio_url": audio_url,
+                        "needs_merge": audio_url is not None and video_url != audio_url,
+                        "duration": info.get("duration"),
+                        "filesize": info.get("filesize") or info.get("filesize_approx"),
+                    }
 
-            if not download_url:
-                raise HTTPException(status_code=500, detail="Could not get download URL")
+        if not download_url:
+            raise HTTPException(status_code=500, detail="Could not get download URL")
 
-            return {
-                "success": True,
-                "platform": platform,
-                "title": info.get("title", "video"),
-                "ext": info.get("ext", "mp4"),
-                "download_url": download_url,
-                "audio_url": None,
-                "needs_merge": False,
-                "duration": info.get("duration"),
-                "filesize": info.get("filesize") or info.get("filesize_approx"),
-            }
+        return {
+            "success": True,
+            "platform": platform,
+            "title": info.get("title", "video"),
+            "ext": info.get("ext", "mp4"),
+            "download_url": download_url,
+            "audio_url": None,
+            "needs_merge": False,
+            "duration": info.get("duration"),
+            "filesize": info.get("filesize") or info.get("filesize_approx"),
+        }
 
     except yt_dlp.DownloadError as e:
         error_msg = str(e)
@@ -391,50 +410,56 @@ async def proxy_download(request: ProxyDownloadRequest):
             'preferedformat': 'mp4',
         }]
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        # Скачиваем в thread pool
+        loop = asyncio.get_event_loop()
 
-            if not info:
+        def download_sync():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+
+        info = await loop.run_in_executor(executor, download_sync)
+
+        if not info:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise HTTPException(status_code=404, detail="Video not found")
+
+        video_id = info.get("id", "video")
+        expected_file = os.path.join(temp_dir, f"{video_id}.mp4")
+
+        if not os.path.exists(expected_file):
+            files = os.listdir(temp_dir)
+            if files:
+                expected_file = os.path.join(temp_dir, files[0])
+            else:
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                raise HTTPException(status_code=404, detail="Video not found")
+                raise HTTPException(status_code=500, detail="File not created")
 
-            video_id = info.get("id", "video")
-            expected_file = os.path.join(temp_dir, f"{video_id}.mp4")
+        file_size = os.path.getsize(expected_file)
+        title = info.get("title", "video")
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:50]
+        filename = f"{safe_title}.mp4"
 
-            if not os.path.exists(expected_file):
-                files = os.listdir(temp_dir)
-                if files:
-                    expected_file = os.path.join(temp_dir, files[0])
-                else:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                    raise HTTPException(status_code=500, detail="File not created")
+        temp_dir_to_clean = temp_dir
+        file_to_stream = expected_file
 
-            file_size = os.path.getsize(expected_file)
-            title = info.get("title", "video")
-            safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:50]
-            filename = f"{safe_title}.mp4"
+        async def file_streamer():
+            try:
+                with open(file_to_stream, 'rb') as f:
+                    while chunk := f.read(1024 * 1024):
+                        yield chunk
+            finally:
+                shutil.rmtree(temp_dir_to_clean, ignore_errors=True)
 
-            temp_dir_to_clean = temp_dir
-            file_to_stream = expected_file
-
-            async def file_streamer():
-                try:
-                    with open(file_to_stream, 'rb') as f:
-                        while chunk := f.read(1024 * 1024):
-                            yield chunk
-                finally:
-                    shutil.rmtree(temp_dir_to_clean, ignore_errors=True)
-
-            return StreamingResponse(
-                file_streamer(),
-                media_type="video/mp4",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Content-Length": str(file_size),
-                    "X-Video-Title": title[:100],
-                    "X-Video-Duration": str(info.get("duration", 0)),
-                }
-            )
+        return StreamingResponse(
+            file_streamer(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(file_size),
+                "X-Video-Title": title[:100],
+                "X-Video-Duration": str(info.get("duration", 0)),
+            }
+        )
 
     except yt_dlp.DownloadError as e:
         if temp_dir:
