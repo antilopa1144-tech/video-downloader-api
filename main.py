@@ -449,7 +449,7 @@ async def proxy_download(request: ProxyDownloadRequest):
 
         response_headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-Video-Title": title[:100],
+            "X-Video-Title": safe_title,
             "X-Video-Duration": str(duration),
         }
         if content_length:
