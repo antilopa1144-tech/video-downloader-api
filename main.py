@@ -384,11 +384,21 @@ async def proxy_download(request: ProxyDownloadRequest):
     platform = detect_platform(url)
     ydl_opts = get_ydl_opts(platform)
 
-    # Для прокси используем формат без merge (mp4 с аудио)
+    # Для прокси нужны форматы с видео+аудио в одном файле
+    # YouTube разделяет потоки, поэтому выбираем комбинированные форматы
     if format_id:
         format_spec = format_id
     elif quality == "audio":
         format_spec = "bestaudio[ext=m4a]/bestaudio/best"
+    elif platform == "youtube":
+        # YouTube: используем форматы со встроенным аудио (18=360p, 22=720p)
+        if quality == "best" or quality == "720p":
+            format_spec = "22/18/best[ext=mp4]/best"
+        elif quality == "360p":
+            format_spec = "18/best[ext=mp4]/best"
+        else:
+            # Для других качеств пробуем найти комбинированный формат
+            format_spec = "22/18/best[ext=mp4]/best"
     elif quality == "best":
         format_spec = "best[ext=mp4]/best"
     elif quality in ["1080p", "720p", "480p", "360p"]:
