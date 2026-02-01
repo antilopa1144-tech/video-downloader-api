@@ -1,11 +1,12 @@
 """
 Video Downloader API Server
-FastAPI сервер для скачивания видео через yt-dlp с полной поддержкой JS runtime.
+FastAPI server for downloading videos via yt-dlp with full JS runtime support.
 
 Endpoints:
-- GET /health - проверка работоспособности
-- POST /info - получить информацию о видео
-- POST /download - получить прямую ссылку на видео
+- GET /health - health check
+- POST /info - get video info
+- POST /download - get direct download URL
+- POST /proxy-download - download video through server (streaming)
 """
 
 import os
@@ -13,20 +14,21 @@ import json
 import asyncio
 import hashlib
 import time
+import tempfile
+import shutil
 from typing import Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, HttpUrl
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 import yt_dlp
 
 app = FastAPI(
     title="Video Downloader API",
-    description="API для скачивания видео с YouTube, VK, TikTok и других платформ",
-    version="1.0.0"
+    description="API for downloading videos from YouTube, VK, TikTok and other platforms",
+    version="1.1.0"
 )
 
-# CORS для доступа из приложения
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,9 +37,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Кэш для информации о видео (в памяти, для простоты)
 video_cache = {}
-CACHE_TTL = 300  # 5 минут
+CACHE_TTL = 300
 
 
 class VideoRequest(BaseModel):
@@ -47,23 +48,26 @@ class VideoRequest(BaseModel):
 class DownloadRequest(BaseModel):
     url: str
     format_id: Optional[str] = None
-    quality: Optional[str] = "best"  # best, 1080p, 720p, 480p, 360p, audio
+    quality: Optional[str] = "best"
+
+
+class ProxyDownloadRequest(BaseModel):
+    url: str
+    format_id: Optional[str] = None
+    quality: Optional[str] = "best"
 
 
 def get_cache_key(url: str) -> str:
-    """Создать ключ кэша для URL."""
     return hashlib.md5(url.encode()).hexdigest()
 
 
 def is_cache_valid(cache_entry: dict) -> bool:
-    """Проверить, валиден ли кэш."""
     if not cache_entry:
         return False
     return time.time() - cache_entry.get("timestamp", 0) < CACHE_TTL
 
 
 def detect_platform(url: str) -> str:
-    """Определить платформу по URL."""
     url_lower = url.lower()
     if 'youtube.com' in url_lower or 'youtu.be' in url_lower:
         return 'youtube'
@@ -73,10 +77,6 @@ def detect_platform(url: str) -> str:
         return 'tiktok'
     elif 'rutube.ru' in url_lower:
         return 'rutube'
-    elif 'instagram.com' in url_lower:
-        return 'instagram'
-    elif 'twitter.com' in url_lower or 'x.com' in url_lower:
-        return 'twitter'
     elif 'ok.ru' in url_lower:
         return 'ok'
     elif 'dzen.ru' in url_lower:
@@ -85,7 +85,6 @@ def detect_platform(url: str) -> str:
 
 
 def get_ydl_opts(platform: str) -> dict:
-    """Получить оптимальные опции yt-dlp для платформы."""
     base_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -134,23 +133,21 @@ def get_ydl_opts(platform: str) -> dict:
 
 @app.get("/")
 async def root():
-    """Главная страница."""
     return {
         "service": "Video Downloader API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "endpoints": {
             "health": "/health",
             "info": "POST /info",
-            "download": "POST /download"
+            "download": "POST /download",
+            "proxy_download": "POST /proxy-download"
         }
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Проверка работоспособности сервера."""
     try:
-        # Проверяем что yt-dlp работает
         version = yt_dlp.version.__version__
         return {
             "status": "healthy",
@@ -166,15 +163,9 @@ async def health_check():
 
 @app.post("/info")
 async def get_video_info(request: VideoRequest):
-    """
-    Получить информацию о видео.
-
-    Возвращает: название, длительность, форматы, превью и т.д.
-    """
     url = request.url
     cache_key = get_cache_key(url)
 
-    # Проверяем кэш
     if cache_key in video_cache and is_cache_valid(video_cache[cache_key]):
         return video_cache[cache_key]["data"]
 
@@ -187,15 +178,13 @@ async def get_video_info(request: VideoRequest):
             info = ydl.extract_info(url, download=False)
 
             if not info:
-                raise HTTPException(status_code=404, detail="Видео не найдено")
+                raise HTTPException(status_code=404, detail="Video not found")
 
-            # Парсим форматы
             formats = []
             for f in info.get("formats", []):
                 vcodec = f.get("vcodec", "none")
                 acodec = f.get("acodec", "none")
 
-                # Аудио
                 if vcodec == "none" and acodec != "none":
                     formats.append({
                         "format_id": f.get("format_id"),
@@ -205,9 +194,8 @@ async def get_video_info(request: VideoRequest):
                         "filesize": f.get("filesize") or f.get("filesize_approx"),
                         "has_audio": True,
                         "has_video": False,
-                        "url": f.get("url"),
+                        "height": 0,
                     })
-                # Видео
                 elif vcodec != "none":
                     height = f.get("height", 0) or 0
                     formats.append({
@@ -219,17 +207,14 @@ async def get_video_info(request: VideoRequest):
                         "has_audio": acodec != "none",
                         "has_video": True,
                         "height": height,
-                        "url": f.get("url"),
                     })
 
-            # Сортируем по качеству
             formats = sorted(
                 [f for f in formats if f.get("height", 0) > 0 or f.get("quality") == "audio"],
                 key=lambda x: x.get("height", 0),
                 reverse=True
             )
 
-            # Убираем дубликаты
             seen = set()
             unique_formats = []
             for f in formats:
@@ -254,7 +239,6 @@ async def get_video_info(request: VideoRequest):
                 }
             }
 
-            # Кэшируем
             video_cache[cache_key] = {
                 "data": result,
                 "timestamp": time.time()
@@ -265,29 +249,21 @@ async def get_video_info(request: VideoRequest):
     except yt_dlp.DownloadError as e:
         error_msg = str(e)
         if "Sign in" in error_msg or "bot" in error_msg.lower():
-            raise HTTPException(status_code=403, detail="Платформа требует авторизацию")
+            raise HTTPException(status_code=403, detail="Platform requires authorization")
         elif "Private" in error_msg:
-            raise HTTPException(status_code=403, detail="Видео приватное")
+            raise HTTPException(status_code=403, detail="Video is private")
         elif "unavailable" in error_msg.lower():
-            raise HTTPException(status_code=404, detail="Видео недоступно или удалено")
+            raise HTTPException(status_code=404, detail="Video unavailable or deleted")
         elif "geo" in error_msg.lower() or "country" in error_msg.lower():
-            raise HTTPException(status_code=403, detail="Видео недоступно в вашем регионе")
+            raise HTTPException(status_code=403, detail="Video not available in your region")
         else:
-            raise HTTPException(status_code=500, detail=f"Ошибка извлечения: {error_msg[:200]}")
+            raise HTTPException(status_code=500, detail=f"Extraction error: {error_msg[:200]}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
 @app.post("/download")
 async def get_download_url(request: DownloadRequest):
-    """
-    Получить прямую ссылку на скачивание видео.
-
-    Параметры:
-    - url: URL видео
-    - format_id: ID конкретного формата (опционально)
-    - quality: Желаемое качество: best, 1080p, 720p, 480p, 360p, audio
-    """
     url = request.url
     format_id = request.format_id
     quality = request.quality or "best"
@@ -295,7 +271,6 @@ async def get_download_url(request: DownloadRequest):
     platform = detect_platform(url)
     ydl_opts = get_ydl_opts(platform)
 
-    # Определяем формат
     if format_id:
         format_spec = format_id
     elif quality == "audio":
@@ -315,23 +290,18 @@ async def get_download_url(request: DownloadRequest):
             info = ydl.extract_info(url, download=False)
 
             if not info:
-                raise HTTPException(status_code=404, detail="Видео не найдено")
+                raise HTTPException(status_code=404, detail="Video not found")
 
-            # Получаем URL для скачивания
             download_url = info.get("url")
 
-            # Если URL нет в корне, ищем в formats
             if not download_url:
                 formats = info.get("formats", [])
                 if formats:
-                    # Берём последний (обычно лучший после сортировки)
                     download_url = formats[-1].get("url")
 
-            # Для merged форматов может быть requested_formats
             if not download_url:
                 requested = info.get("requested_formats", [])
                 if requested:
-                    # Возвращаем оба URL (video и audio)
                     video_url = None
                     audio_url = None
                     for f in requested:
@@ -354,7 +324,7 @@ async def get_download_url(request: DownloadRequest):
                         }
 
             if not download_url:
-                raise HTTPException(status_code=500, detail="Не удалось получить ссылку на скачивание")
+                raise HTTPException(status_code=500, detail="Could not get download URL")
 
             return {
                 "success": True,
@@ -371,16 +341,118 @@ async def get_download_url(request: DownloadRequest):
     except yt_dlp.DownloadError as e:
         error_msg = str(e)
         if "Sign in" in error_msg or "bot" in error_msg.lower():
-            raise HTTPException(status_code=403, detail="Платформа требует авторизацию")
+            raise HTTPException(status_code=403, detail="Platform requires authorization")
         elif "Private" in error_msg:
-            raise HTTPException(status_code=403, detail="Видео приватное")
+            raise HTTPException(status_code=403, detail="Video is private")
         elif "unavailable" in error_msg.lower():
-            raise HTTPException(status_code=404, detail="Видео недоступно")
+            raise HTTPException(status_code=404, detail="Video unavailable")
         else:
-            raise HTTPException(status_code=500, detail=f"Ошибка: {error_msg[:200]}")
+            raise HTTPException(status_code=500, detail=f"Error: {error_msg[:200]}")
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+
+
+@app.post("/proxy-download")
+async def proxy_download(request: ProxyDownloadRequest):
+    """Download video through server and return as stream."""
+    url = request.url
+    format_id = request.format_id
+    quality = request.quality or "best"
+
+    platform = detect_platform(url)
+    ydl_opts = get_ydl_opts(platform)
+
+    if format_id:
+        format_spec = format_id
+    elif quality == "audio":
+        format_spec = "bestaudio[ext=m4a]/bestaudio/best"
+    elif quality == "best":
+        format_spec = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+    elif quality in ["1080p", "720p", "480p", "360p"]:
+        height = quality.replace("p", "")
+        format_spec = f"best[height<={height}][ext=mp4]/bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}]/best"
+    else:
+        format_spec = "best[ext=mp4]/best"
+
+    ydl_opts['format'] = format_spec
+
+    temp_dir = None
+    try:
+        temp_dir = tempfile.mkdtemp()
+        output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
+
+        ydl_opts['outtmpl'] = output_template
+        ydl_opts['merge_output_format'] = 'mp4'
+
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4',
+        }]
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+            if not info:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=404, detail="Video not found")
+
+            video_id = info.get("id", "video")
+            expected_file = os.path.join(temp_dir, f"{video_id}.mp4")
+
+            if not os.path.exists(expected_file):
+                files = os.listdir(temp_dir)
+                if files:
+                    expected_file = os.path.join(temp_dir, files[0])
+                else:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    raise HTTPException(status_code=500, detail="File not created")
+
+            file_size = os.path.getsize(expected_file)
+            title = info.get("title", "video")
+            safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:50]
+            filename = f"{safe_title}.mp4"
+
+            temp_dir_to_clean = temp_dir
+            file_to_stream = expected_file
+
+            async def file_streamer():
+                try:
+                    with open(file_to_stream, 'rb') as f:
+                        while chunk := f.read(1024 * 1024):
+                            yield chunk
+                finally:
+                    shutil.rmtree(temp_dir_to_clean, ignore_errors=True)
+
+            return StreamingResponse(
+                file_streamer(),
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(file_size),
+                    "X-Video-Title": title[:100],
+                    "X-Video-Duration": str(info.get("duration", 0)),
+                }
+            )
+
+    except yt_dlp.DownloadError as e:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        error_msg = str(e)
+        if "Sign in" in error_msg or "bot" in error_msg.lower():
+            raise HTTPException(status_code=403, detail="Platform requires authorization")
+        elif "Private" in error_msg:
+            raise HTTPException(status_code=403, detail="Video is private")
+        elif "unavailable" in error_msg.lower() or "not available" in error_msg.lower():
+            raise HTTPException(status_code=404, detail="Video unavailable or deleted")
+        else:
+            raise HTTPException(status_code=500, detail=f"Error: {error_msg[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
