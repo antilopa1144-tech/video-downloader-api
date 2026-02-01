@@ -418,7 +418,10 @@ async def proxy_download(request: ProxyDownloadRequest):
             raise HTTPException(status_code=500, detail="Could not get download URL")
 
         title = info.get("title", "video")
-        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:50]
+        # Удаляем все не-ASCII символы для имени файла
+        safe_title = "".join(c for c in title if c.isascii() and (c.isalnum() or c in (' ', '-', '_'))).strip()[:50]
+        if not safe_title:
+            safe_title = "video"
         ext = info.get("ext", "mp4")
         filename = f"{safe_title}.{ext}"
         duration = info.get("duration", 0)
