@@ -6,17 +6,16 @@ Endpoints:
 - GET /health - health check
 - POST /info - get video info
 - POST /download - get direct download URL
-- POST /proxy-download - download video through server (streaming)
+- POST /stream - stream video directly (no temp file, starts immediately)
 """
 
 import os
 import hashlib
 import time
-import tempfile
-import shutil
+import subprocess
+import asyncio
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
-import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -26,7 +25,7 @@ import yt_dlp
 app = FastAPI(
     title="Video Downloader API",
     description="API for downloading videos from YouTube, VK, TikTok and other platforms",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -37,7 +36,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Thread pool для выполнения блокирующих операций yt-dlp
 executor = ThreadPoolExecutor(max_workers=4)
 
 video_cache = {}
@@ -54,7 +52,7 @@ class DownloadRequest(BaseModel):
     quality: Optional[str] = "best"
 
 
-class ProxyDownloadRequest(BaseModel):
+class StreamRequest(BaseModel):
     url: str
     format_id: Optional[str] = None
     quality: Optional[str] = "best"
@@ -141,22 +139,16 @@ def _extract_info_sync(url: str, ydl_opts: dict):
         return ydl.extract_info(url, download=False)
 
 
-def _download_video_sync(url: str, ydl_opts: dict):
-    """Синхронное скачивание видео."""
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
-
-
 @app.get("/")
 async def root():
     return {
         "service": "Video Downloader API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "endpoints": {
             "health": "/health",
             "info": "POST /info",
             "download": "POST /download",
-            "proxy_download": "POST /proxy-download"
+            "stream": "POST /stream"
         }
     }
 
@@ -190,7 +182,6 @@ async def get_video_info(request: VideoRequest):
     ydl_opts['extract_flat'] = False
 
     try:
-        # Выполняем в thread pool чтобы не блокировать event loop
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, _extract_info_sync, url, ydl_opts)
 
@@ -373,112 +364,122 @@ async def get_download_url(request: DownloadRequest):
         raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
-@app.post("/proxy-download")
-async def proxy_download(request: ProxyDownloadRequest):
-    """Download video through server and return as stream."""
+@app.post("/stream")
+async def stream_download(request: StreamRequest):
+    """
+    Stream video directly using yt-dlp pipe.
+    Starts streaming immediately without waiting for full download.
+    """
     url = request.url
     format_id = request.format_id
     quality = request.quality or "best"
 
     platform = detect_platform(url)
+
+    # Сначала получаем информацию о видео для имени файла
     ydl_opts = get_ydl_opts(platform)
 
+    try:
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, _extract_info_sync, url, ydl_opts)
+
+        if not info:
+            raise HTTPException(status_code=404, detail="Video not found")
+
+        title = info.get("title", "video")
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:50]
+        filename = f"{safe_title}.mp4"
+        duration = info.get("duration", 0)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get video info: {str(e)[:100]}")
+
+    # Определяем формат для yt-dlp
     if format_id:
         format_spec = format_id
     elif quality == "audio":
         format_spec = "bestaudio[ext=m4a]/bestaudio/best"
     elif quality == "best":
-        format_spec = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+        # Для стриминга предпочитаем форматы где видео и аудио вместе
+        format_spec = "best[ext=mp4]/best"
     elif quality in ["1080p", "720p", "480p", "360p"]:
         height = quality.replace("p", "")
-        format_spec = f"best[height<={height}][ext=mp4]/bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}]/best"
+        format_spec = f"best[height<={height}][ext=mp4]/best[height<={height}]/best"
     else:
         format_spec = "best[ext=mp4]/best"
 
-    ydl_opts['format'] = format_spec
+    # Строим команду yt-dlp для вывода в stdout
+    cmd = [
+        "yt-dlp",
+        "-f", format_spec,
+        "-o", "-",  # Вывод в stdout
+        "--no-playlist",
+        "--no-warnings",
+        "--quiet",
+        url
+    ]
 
-    temp_dir = None
-    try:
-        temp_dir = tempfile.mkdtemp()
-        output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
+    # Добавляем user-agent в зависимости от платформы
+    if platform == 'youtube':
+        cmd.extend(["--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36"])
+    elif platform == 'vk':
+        cmd.extend(["--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36"])
+        cmd.extend(["--referer", "https://vk.com/"])
+    elif platform == 'tiktok':
+        cmd.extend(["--user-agent", "TikTok 33.0.0 rv:330018 (iPhone; iOS 17.3; en_US) Cronet"])
 
-        ydl_opts['outtmpl'] = output_template
-        ydl_opts['merge_output_format'] = 'mp4'
+    async def generate():
+        """Генератор для стриминга данных от yt-dlp."""
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
 
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }]
+            # Читаем и отдаём данные чанками
+            while True:
+                chunk = await process.stdout.read(64 * 1024)  # 64KB чанки
+                if not chunk:
+                    break
+                yield chunk
 
-        # Скачиваем в thread pool
-        loop = asyncio.get_event_loop()
+            # Проверяем код возврата
+            await process.wait()
 
-        def download_sync():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=True)
+            if process.returncode != 0:
+                stderr = await process.stderr.read()
+                error_msg = stderr.decode('utf-8', errors='ignore')[:200]
+                # Логируем ошибку, но не можем отправить её клиенту после начала стриминга
+                print(f"yt-dlp error: {error_msg}")
 
-        info = await loop.run_in_executor(executor, download_sync)
+        except Exception as e:
+            print(f"Stream error: {e}")
+        finally:
+            if process and process.returncode is None:
+                try:
+                    process.kill()
+                except:
+                    pass
 
-        if not info:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            raise HTTPException(status_code=404, detail="Video not found")
+    return StreamingResponse(
+        generate(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Video-Title": title[:100],
+            "X-Video-Duration": str(duration),
+            "Transfer-Encoding": "chunked",
+        }
+    )
 
-        video_id = info.get("id", "video")
-        expected_file = os.path.join(temp_dir, f"{video_id}.mp4")
 
-        if not os.path.exists(expected_file):
-            files = os.listdir(temp_dir)
-            if files:
-                expected_file = os.path.join(temp_dir, files[0])
-            else:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                raise HTTPException(status_code=500, detail="File not created")
-
-        file_size = os.path.getsize(expected_file)
-        title = info.get("title", "video")
-        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:50]
-        filename = f"{safe_title}.mp4"
-
-        temp_dir_to_clean = temp_dir
-        file_to_stream = expected_file
-
-        async def file_streamer():
-            try:
-                with open(file_to_stream, 'rb') as f:
-                    while chunk := f.read(1024 * 1024):
-                        yield chunk
-            finally:
-                shutil.rmtree(temp_dir_to_clean, ignore_errors=True)
-
-        return StreamingResponse(
-            file_streamer(),
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(file_size),
-                "X-Video-Title": title[:100],
-                "X-Video-Duration": str(info.get("duration", 0)),
-            }
-        )
-
-    except yt_dlp.DownloadError as e:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        error_msg = str(e)
-        if "Sign in" in error_msg or "bot" in error_msg.lower():
-            raise HTTPException(status_code=403, detail="Platform requires authorization")
-        elif "Private" in error_msg:
-            raise HTTPException(status_code=403, detail="Video is private")
-        elif "unavailable" in error_msg.lower() or "not available" in error_msg.lower():
-            raise HTTPException(status_code=404, detail="Video unavailable or deleted")
-        else:
-            raise HTTPException(status_code=500, detail=f"Error: {error_msg[:200]}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e)[:200])
+# Для совместимости оставляем старый endpoint
+@app.post("/proxy-download")
+async def proxy_download(request: StreamRequest):
+    """Redirect to stream endpoint for backwards compatibility."""
+    return await stream_download(request)
 
 
 if __name__ == "__main__":
